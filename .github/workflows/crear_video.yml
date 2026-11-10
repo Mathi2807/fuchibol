@@ -1,0 +1,66 @@
+name: Crear video de fútbol
+
+on:
+  workflow_dispatch:
+    inputs:
+      tema:
+        description: 'Tema del video (ej: El escándalo del árbitro Guruceta)'
+        required: true
+        type: string
+      categoria:
+        description: 'Categoría del video'
+        required: true
+        type: choice
+        options:
+          - polemica
+          - historia
+          - curiosidades
+      minutos:
+        description: 'Duración aproximada en minutos (opcional)'
+        required: false
+        default: '8'
+        type: string
+
+jobs:
+  crear_video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Instalar FFmpeg y fuentes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Instalar dependencias de Python
+        run: pip install -r requirements.txt
+
+      - name: Generar el video
+        env:
+          TEMA: ${{ github.event.inputs.tema }}
+          CATEGORIA: ${{ github.event.inputs.categoria }}
+          MINUTOS: ${{ github.event.inputs.minutos }}
+        run: |
+          python main.py --tema "$TEMA" --categoria "$CATEGORIA" --minutos "${MINUTOS:-8}"
+
+      - name: Comprobar el .zip final
+        run: |
+          test -f youtube_upload.zip
+          unzip -l youtube_upload.zip
+
+      - name: Guardar youtube_upload.zip como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube_upload
+          path: youtube_upload.zip
+          retention-days: 14
+          if-no-files-found: error
