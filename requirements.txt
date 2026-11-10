@@ -1,0 +1,4 @@
+g4f
+edge-tts
+requests
+Pillow
