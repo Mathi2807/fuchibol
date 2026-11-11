@@ -38,6 +38,7 @@ import unicodedata
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
@@ -423,7 +424,7 @@ def guion_desde_wikipedia(tema: str, categoria: str, minutos: float) -> dict:
     palabras = [w for w in re.findall(r"\w+", tema) if len(w) > 3]
     return {"titulo": f"{tema}: la historia completa", "descripcion": f"{tema}. Todo lo que debes saber.",
             "tags": [tema] + palabras + ["fútbol", "futbol", categoria],
-            "texto_miniatura": " ".join(tema.upper().split()[:4]),
+            "texto_miniatura": texto_corto_desde_tema(tema),
             "secciones": [{"titulo": f"Parte {i + 1}", "narracion": s, "busqueda": tema}
                           for i, s in enumerate(secciones)],
             "origen": "wikipedia"}
@@ -573,7 +574,35 @@ def crear_subtitulos(audio: dict, ruta: Path) -> Path:
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. IMÁGENES  (DuckDuckGo -> Bing -> Wikimedia Commons -> tarjetas generadas)
 # ──────────────────────────────────────────────────────────────────────────────
-def _urls_duckduckgo(q: str, n: int = 20) -> list[str]:
+def _texto_url(t: str) -> str:
+    """Convierte títulos/URLs en palabras sueltas (para comparar con las palabras clave)."""
+    return re.sub(r"[_\-./:%+=&?]+", " ", unquote(t))
+
+
+EXCLUIR_IMG = re.compile(r"flag|bandera|logo|escudo|icon|commons|ambox|question|symbol|map|mapa|stub|"
+                         r"wiki|\.svg|crest|badge|signature|firma|button|edit", re.I)
+
+
+def _items_wikipedia(q: str, n: int = 40) -> list[dict]:
+    """Imágenes que usan los artículos de Wikipedia sobre el tema: las más fiables (y libres)."""
+    base = "https://es.wikipedia.org/w/api.php"
+    r = requests.get(base, headers=UA, timeout=20, params={
+        "action": "query", "list": "search", "srsearch": q, "format": "json", "srlimit": 2, "utf8": 1}).json()
+    items = []
+    for hit in r.get("query", {}).get("search", []):
+        d = requests.get(base, headers=UA, timeout=20, params={
+            "action": "query", "generator": "images", "titles": hit["title"], "gimlimit": 40,
+            "prop": "imageinfo", "iiprop": "url|mime|size", "iiurlwidth": 1600, "format": "json"}).json()
+        paginas = sorted(d.get("query", {}).get("pages", {}).values(), key=lambda p: p.get("index", 0))
+        for p in paginas:
+            ii = (p.get("imageinfo") or [{}])[0]
+            if (ii.get("mime") in ("image/jpeg", "image/png") and ii.get("width", 0) >= 600
+                    and not EXCLUIR_IMG.search(p.get("title", ""))):
+                items.append({"url": ii.get("thumburl") or ii.get("url"), "texto": "", "auto": True})
+    return items[:n]
+
+
+def _items_duckduckgo(q: str, n: int = 40) -> list[dict]:
     s = requests.Session()
     s.headers.update(UA)
     r = s.get("https://duckduckgo.com/", params={"q": q, "iax": "images", "ia": "images"}, timeout=15)
@@ -583,44 +612,58 @@ def _urls_duckduckgo(q: str, n: int = 20) -> list[str]:
     r = s.get("https://duckduckgo.com/i.js", timeout=15, headers={"Referer": "https://duckduckgo.com/"},
               params={"l": "es-es", "o": "json", "q": q, "vqd": m.group(1), "f": ",,,,,", "p": "1"})
     r.raise_for_status()
-    return [x["image"] for x in r.json().get("results", []) if x.get("image")][:n]
+    return [{"url": x["image"], "texto": _texto_url(f'{x.get("title", "")} {x.get("url", "")} {x["image"]}')}
+            for x in r.json().get("results", []) if x.get("image")][:n]
 
 
-def _urls_bing(q: str, n: int = 20) -> list[str]:
+def _items_bing(q: str, n: int = 40) -> list[dict]:
     r = requests.get("https://www.bing.com/images/search", headers=UA, timeout=15,
                      params={"q": q, "form": "HDRSC2", "first": 1, "qft": "+filterui:imagesize-large"})
     r.raise_for_status()
-    urls = [html.unescape(u) for u in re.findall(r"murl&quot;:&quot;(.*?)&quot;", r.text)]
-    return urls[:n]
+    items = []
+    for blob in re.findall(r' m="(\{.*?\})"', r.text):          # cada resultado trae título y página
+        try:
+            d = json.loads(html.unescape(blob))
+        except ValueError:
+            continue
+        if d.get("murl"):
+            items.append({"url": d["murl"], "texto": _texto_url(f'{d.get("t", "")} {d.get("purl", "")} {d["murl"]}')})
+    if not items:
+        items = [{"url": html.unescape(u), "texto": _texto_url(html.unescape(u))}
+                 for u in re.findall(r"murl&quot;:&quot;(.*?)&quot;", r.text)]
+    return items[:n]
 
 
-def _urls_commons(q: str, n: int = 20) -> list[str]:
+def _items_commons(q: str, n: int = 40) -> list[dict]:
     r = requests.get("https://commons.wikimedia.org/w/api.php", headers=UA, timeout=20,
                      params={"action": "query", "generator": "search", "gsrnamespace": 6,
                              "gsrsearch": q, "gsrlimit": n, "prop": "imageinfo",
                              "iiprop": "url|mime", "iiurlwidth": 1600, "format": "json"})
     r.raise_for_status()
-    urls = []
-    for p in r.json().get("query", {}).get("pages", {}).values():
+    items = []
+    paginas = sorted(r.json().get("query", {}).get("pages", {}).values(), key=lambda p: p.get("index", 0))
+    for p in paginas:
         ii = (p.get("imageinfo") or [{}])[0]
-        if ii.get("mime") in ("image/jpeg", "image/png"):
-            urls.append(ii.get("thumburl") or ii.get("url"))
-    return [u for u in urls if u]
+        u = ii.get("thumburl") or ii.get("url")
+        if u and ii.get("mime") in ("image/jpeg", "image/png"):
+            items.append({"url": u, "texto": _texto_url(p.get("title", ""))})
+    return items
 
 
-FUENTES_IMG = [("duckduckgo", _urls_duckduckgo), ("bing", _urls_bing), ("commons", _urls_commons)]
+FUENTES_IMG = [("duckduckgo", _items_duckduckgo), ("bing", _items_bing), ("commons", _items_commons)]
 
 
-def candidatas(q: str):
-    """Generador perezoso de URLs: si una fuente falla o se agota, sigue con la siguiente."""
-    for nombre, fn in FUENTES_IMG:
+def candidatas(q: str, usar_wiki: bool = False):
+    """Generador perezoso de resultados {url, texto}: si una fuente falla o se agota, sigue con la siguiente."""
+    fuentes = ([("wikipedia", _items_wikipedia)] if usar_wiki else []) + FUENTES_IMG
+    for nombre, fn in fuentes:
         try:
-            urls = fn(q)
-            log(f"    {nombre}: {len(urls)} resultados para «{q}»")
+            items = fn(q)
+            log(f"    {nombre}: {len(items)} resultados para «{q}»")
         except Exception as e:  # noqa: BLE001
             log(f"    {nombre} falló para «{q}»: {str(e)[:90]}")
             continue
-        yield from urls
+        yield from items
 
 
 @reintentar(intentos=2, espera=1.0)
@@ -733,41 +776,88 @@ def crear_placeholder(texto: str, ruta: Path, categoria: str, variante: int = 0)
     img.save(ruta, "JPEG", quality=90)
 
 
-def _con_sufijo(q: str) -> str:
-    q = q.strip()
-    return q if re.search(r"f[uú]tbol|football|soccer", q, re.I) else f"{q} fútbol"
+# Palabras demasiado genéricas: no sirven para decidir si una imagen trata del tema
+GENERICAS = _raices("fútbol football soccer partido historia datos curiosos curiosidades polémica polemica "
+                    "escándalo escandalo mejores grandes fotos imagen imagenes video highlights completa")
+
+
+def claves(q: str) -> set[str]:
+    """Raíces de las palabras 'distintivas' de una consulta (sin artículos ni palabras genéricas)."""
+    return _raices(q) - GENERICAS
+
+
+def puntuar_relevancia(item: dict, kw: set[str]) -> int:
+    """0 = descartar. Las imágenes de artículos de Wikipedia valen siempre (99). Para el resto, el título
+    o la página de origen deben contener varias palabras clave del tema (así no entran motores ni Mbappé)."""
+    if item.get("auto"):
+        return 99
+    if not kw:
+        return 1
+    coinc = len(kw & _raices(item["texto"]))
+    necesarias = 1 if len(kw) <= 1 else max(2, math.ceil(0.6 * len(kw)))   # ~60 % de las palabras clave
+    return coinc if coinc >= necesarias else 0
+
+
+def limpiar_consulta(t: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[\"“”«»]", "", t)).strip()
+
+
+def texto_corto_desde_tema(tema: str) -> str:
+    """Frase corta para la miniatura: sin comillas ni artículo inicial, máx. 6 palabras, sin acabar en 'de/contra…'."""
+    pal = limpiar_consulta(tema).split()
+    if pal and pal[0].lower() in ("el", "la", "los", "las", "un", "una"):
+        pal = pal[1:]
+    pal = pal[:6]
+    vacias = {sin_tildes(x) for x in STOP_ES}
+    while len(pal) > 1 and sin_tildes(pal[-1].lower()) in vacias:
+        pal.pop()
+    return " ".join(pal).upper() or "FÚTBOL"
+
+
+def construir_consultas(tema: str, guion: dict) -> list[dict]:
+    """Varias búsquedas del tema (la primera usa también Wikipedia) + una por sección del guion."""
+    base = limpiar_consulta(tema)
+    clave = " ".join(w for w in re.findall(r"\w+", base) if _raices(w) - GENERICAS)
+    candidatas_q = [(base, True), (clave, False), (f"{clave} partido", False)]
+    candidatas_q += [(limpiar_consulta(s["busqueda"]), False) for s in guion["secciones"]]
+    consultas, vistos = [], set()
+    for q, wiki in candidatas_q:
+        if q and q.lower() not in vistos:
+            vistos.add(q.lower())
+            consultas.append({"q": q, "wiki": wiki, "kw": claves(q) | (claves(base) if q != base else set())})
+    return consultas
 
 
 def obtener_imagenes(tema: str, guion: dict, carpeta: Path, categoria: str):
-    """Descarga entre IMG_MIN e IMG_MAX imágenes. Devuelve (pool, consulta_por_seccion).
-    Cada elemento del pool: {path, orig, q, real}. Nunca falla: completa con tarjetas."""
+    """Descarga hasta IMG_MAX imágenes RELACIONADAS con el tema. Devuelve (pool, consulta_por_seccion).
+    Cada elemento: {path, orig, q, real, score}. Si hay pocas, completa con tarjetas de texto
+    (siempre relacionadas con el tema, nunca fotos al azar)."""
     carpeta.mkdir(parents=True, exist_ok=True)
-    queries: list[str] = []
-    for q in [tema] + [s["busqueda"] for s in guion["secciones"]]:
-        q = _con_sufijo(q)
-        if q.lower() not in [x.lower() for x in queries]:
-            queries.append(q)
-    qs_seccion = [next(i for i, x in enumerate(queries) if x.lower() == _con_sufijo(s["busqueda"]).lower())
-                  for s in guion["secciones"]]
-    generales = ["fútbol estadio lleno", "soccer match stadium", "balón de fútbol césped"]
-    todas = queries + generales
-    iters = {i: candidatas(q) for i, q in enumerate(todas)}
-    intentos = {i: 0 for i in iters}
+    consultas = construir_consultas(tema, guion)
+    qs_seccion = []
+    for sec in guion["secciones"]:
+        q = limpiar_consulta(sec["busqueda"]).lower()
+        qs_seccion.append(next((i for i, c in enumerate(consultas) if c["q"].lower() == q), 0))
+    iters = {i: candidatas(c["q"], c["wiki"]) for i, c in enumerate(consultas)}
+    examinadas = {i: 0 for i in iters}
     vistos: set[str] = set()
     pool: list[dict] = []
     limite = time.time() + 240                       # presupuesto máximo de tiempo para imágenes
 
     def tomar(i: int, cuantas: int) -> None:
         ok = 0
-        while ok < cuantas and len(pool) < IMG_MAX and intentos[i] < 12 and time.time() < limite:
+        while ok < cuantas and len(pool) < IMG_MAX and examinadas[i] < 80 and time.time() < limite:
             try:
-                url = next(iters[i])
+                item = next(iters[i])
             except StopIteration:
-                intentos[i] = 99
+                examinadas[i] = 99
                 return
-            intentos[i] += 1
+            examinadas[i] += 1
+            puntos = puntuar_relevancia(item, consultas[i]["kw"])
+            if not puntos:
+                continue                              # no parece tratar del tema: se descarta
             try:
-                datos = _bajar(url)
+                datos = _bajar(item["url"])
                 h = hashlib.md5(datos).hexdigest()
                 if h in vistos:
                     continue
@@ -779,29 +869,26 @@ def obtener_imagenes(tema: str, guion: dict, carpeta: Path, categoria: str):
             ruta, orig = carpeta / f"img_{n:02d}.jpg", carpeta / f"orig_{n:02d}.jpg"
             preparar_imagen(img).save(ruta, "JPEG", quality=90)
             ImageOps.contain(img, (1600, 1600)).save(orig, "JPEG", quality=90)
-            pool.append({"path": ruta, "orig": orig, "q": i, "real": True})
+            pool.append({"path": ruta, "orig": orig, "q": i, "real": True, "score": puntos})
             ok += 1
-            log(f"    + imagen {n + 1} ({img.width}x{img.height})")
+            log(f"    + imagen {n + 1} ({img.width}x{img.height}) relevancia {puntos}")
 
+    tomar(0, 5)                                       # primero: lo más fiable (artículo de Wikipedia)
     for _ in range(3):                                # varias pasadas para repartir entre consultas
-        for i in range(len(queries)):
+        for i in range(len(consultas)):
             tomar(i, 2)
             time.sleep(0.3)
         if len(pool) >= IMG_MAX:
             break
-    if len(pool) < IMG_MIN:                           # consultas generales de refuerzo
-        for i in range(len(queries), len(todas)):
-            tomar(i, 3)
     reales = len(pool)
-    textos = [tema] + [s["titulo"] for s in guion["secciones"]]
-    while len(pool) < IMG_MIN:                        # último recurso: tarjetas generadas
+    textos = [texto_corto_desde_tema(tema)] + [s["titulo"] for s in guion["secciones"]]
+    while len(pool) < IMG_MIN:                        # último recurso: tarjetas con texto del tema
         n = len(pool)
         ruta = carpeta / f"img_{n:02d}.jpg"
         crear_placeholder(textos[n % len(textos)], ruta, categoria, n)
-        pool.append({"path": ruta, "orig": None, "q": -1, "real": False})
-    log(f"  Imágenes: {reales} reales + {len(pool) - reales} tarjetas generadas")
+        pool.append({"path": ruta, "orig": None, "q": -1, "real": False, "score": 0})
+    log(f"  Imágenes: {reales} relacionadas con el tema + {len(pool) - reales} tarjetas de texto")
     return pool, qs_seccion
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. MINIATURA (Pillow)
@@ -847,8 +934,9 @@ def crear_miniatura(texto: str, categoria: str, pool: list[dict], ruta: Path) ->
     cfg = CATEGORIAS[categoria]
     p = cfg["paleta"]
     lienzo = degradado(TW, TH, p["bg1"], p["bg2"])
-    orig = next((e["orig"] for e in pool
-                 if e.get("orig") and min(Image.open(e["orig"]).size) >= 500), None)
+    aptas = sorted((e for e in pool if e.get("orig") and e.get("score")),
+                   key=lambda e: (e["score"], min(Image.open(e["orig"]).size)), reverse=True)
+    orig = next((e["orig"] for e in aptas if min(Image.open(e["orig"]).size) >= 500), None)
     if orig:
         try:
             ancho = 780
@@ -1085,7 +1173,7 @@ def main() -> int:
         pool, qs_seccion = obtener_imagenes(tema, guion, trabajo / "img", categoria)
 
         log("5/6 Miniatura…")
-        texto_min = limpiar_narracion(guion["texto_miniatura"]) or " ".join(tema.split()[:4])
+        texto_min = limpiar_narracion(guion["texto_miniatura"]) or texto_corto_desde_tema(tema)
         miniatura = trabajo / "miniatura.png"
         try:
             crear_miniatura(texto_min, categoria, pool, miniatura)
