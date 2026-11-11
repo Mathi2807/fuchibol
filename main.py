@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -51,6 +52,7 @@ IMG_MIN, IMG_MAX = 5, 10           # imágenes descargadas por video
 PAUSA_SECCION = 0.35               # segundos de silencio entre secciones de voz
 PALABRAS_POR_MIN = 150             # ritmo medio de locución
 PALABRAS_POR_SECCION = 170
+MIN_PALABRAS_SECCION = 100         # menos que esto se considera respuesta inútil
 
 VOCES = ["es-MX-JorgeNeural", "es-ES-AlvaroNeural"]   # se alternan si una falla
 UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -145,6 +147,7 @@ def quitar_emojis(t: str) -> str:
 # 1. GUION Y METADATOS  (g4f -> Pollinations -> Wikipedia)
 # ──────────────────────────────────────────────────────────────────────────────
 MODELOS_G4F = ["gpt-4o-mini", "gpt-4o", "llama-3.3-70b", "mixtral-8x7b", ""]
+IGNORAR_PROVEEDORES_G4F = ["Copilot", "CopilotAccount", "MicrosoftDesigner", "Bing"]
 SISTEMA = ("Eres un guionista experto de YouTube especializado en fútbol. Escribes en español "
            "neutro. Nunca inventes datos: si no estás seguro de una fecha, cifra o cita, "
            "omítela o exprésala con cautela. No acuses a nadie de delitos sin pruebas.")
@@ -159,7 +162,13 @@ def _llm_g4f(mensajes: list[dict], timeout: int = 120) -> str:
         try:
             cliente = Client()
             kw = {"model": modelo, "messages": mensajes} if modelo else {"messages": mensajes}
-            fut = ex.submit(lambda kw=kw: cliente.chat.completions.create(**kw))
+
+            def pedir(kw=kw):
+                try:   # `ignored` evita proveedores que devuelven avisos en vez de respuestas
+                    return cliente.chat.completions.create(**kw, ignored=IGNORAR_PROVEEDORES_G4F)
+                except TypeError:
+                    return cliente.chat.completions.create(**kw)
+            fut = ex.submit(pedir)
             resp = fut.result(timeout=timeout)
             texto = (resp.choices[0].message.content or "").strip()
             if len(texto) > 30:
@@ -231,7 +240,68 @@ def limpiar_descripcion(t: str) -> str:
     return "\n\n".join(p for p in parrafos if p)
 
 
-def _validar_esquema(texto: str, n: int) -> dict:
+STOP_ES = set("de la el que en y a los se del las por un con no una su para es al lo como más pero "
+              "sus le ya o fue este sí porque esta entre cuando muy sin sobre también me hasta hay donde "
+              "quien desde todo nos durante todos uno les ni contra otros ese eso ante ellos e esto antes "
+              "algunos qué unos yo otro otras otra él tanto esa estos mucho quienes nada muchos cual poco "
+              "ella estar estas algunas algo nosotros fueron era han ser son tras".split())
+STOP_EN = set("the and of to in is that it was for on with as at by this from are be have has had not but "
+              "they which their his her you we will would there been were an or one all what when who so if "
+              "about into than them can only other new some could these two may then do any my now such "
+              "like our over also".split())
+# Frases típicas de respuestas "basura" de proveedores gratuitos (avisos, otros temas, rechazos)
+BASURA = re.compile(r"\b(android|ios|iphone|copilot|chatgpt|openai|gemini|microsoft|windows|bing chat|"
+                    r"language model|as an ai|i'm sorry|i cannot|i can't|modelo de lenguaje|"
+                    r"lo siento, no puedo|api key|deprecat\w*|discontinu\w*|no longer (?:available|supported))\b",
+                    re.I)
+
+
+def sin_tildes(t: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+
+
+def es_espanol(t: str, laxo: bool = False) -> bool:
+    """Heurística rápida: muchas palabras vacías en español y pocas en inglés.
+    `laxo=True` es para textos tipo lista/títulos (esquema), que tienen menos palabras vacías."""
+    pal = re.findall(r"[a-záéíóúñü]+", t.lower())
+    if len(pal) < 25:
+        return True                                   # muy corto para juzgar
+    es = sum(p in STOP_ES for p in pal) / len(pal)
+    en = sum(p in STOP_EN for p in pal) / len(pal)
+    return es >= (0.08 if laxo else 0.20) and en <= 0.08
+
+
+def _raices(t: str) -> set[str]:
+    """Raíces de 5 letras de las palabras 'de contenido' (sirve para medir si un texto trata de un tema)."""
+    out = set()
+    for p in re.findall(r"\w+", sin_tildes(t.lower())):
+        p = re.sub(r"[^a-z0-9]", "", p)
+        if len(p) >= 4 and p not in STOP_ES:
+            out.add(p[:5])
+    return out
+
+
+def son_similares(a: str, b: str, umbral: float = 0.6) -> bool:
+    """True si dos textos comparten la mayor parte de su vocabulario (respuesta repetida)."""
+    ra, rb = _raices(a), _raices(b)
+    return bool(ra and rb) and len(ra & rb) / len(ra | rb) >= umbral
+
+
+def comprobar_texto(texto: str, contexto: str = "", laxo: bool = False) -> None:
+    """Lanza ValueError si el texto no sirve: basura de proveedor, idioma incorrecto o fuera de tema."""
+    m = BASURA.search(texto)
+    if m:
+        raise ValueError(f"texto basura del proveedor (menciona «{m.group(0)}»)")
+    if not es_espanol(texto, laxo):
+        raise ValueError("el texto no está en español")
+    if contexto:
+        ctx = _raices(contexto)
+        comunes = len(_raices(texto) & ctx)
+        if comunes < (2 if len(ctx) >= 8 else 1):
+            raise ValueError("el texto no trata del tema pedido")
+
+
+def _validar_esquema(texto: str, n: int, tema: str = "") -> dict:
     d = extraer_json(texto)
     secs = d.get("secciones")
     if not isinstance(secs, list) or len(secs) < 3:
@@ -243,13 +313,17 @@ def _validar_esquema(texto: str, n: int) -> dict:
         for i, s in enumerate(secs[:n + 2]) if isinstance(s, dict)]
     if not str(d.get("titulo", "")).strip():
         raise ValueError("sin título")
+    resumen = " ".join([str(d.get("titulo", "")), str(d.get("descripcion", ""))] +
+                       [x["titulo"] + " " + x["puntos"] for x in d["secciones"]])
+    comprobar_texto(resumen, tema, laxo=True)
     return d
 
 
-def _validar_narracion(texto: str) -> str:
+def _validar_narracion(texto: str, contexto: str = "") -> str:
     t = limpiar_narracion(texto)
-    if len(t.split()) < 60:
+    if len(t.split()) < MIN_PALABRAS_SECCION:
         raise ValueError("narración demasiado corta")
+    comprobar_texto(t, contexto)
     return t
 
 
@@ -271,7 +345,7 @@ def guion_con_llm(tema: str, categoria: str, minutos: float) -> dict:
         '"busqueda_imagen": "3-5 palabras para buscar fotos reales (persona, equipo, estadio, año)"}]}'
     )
     esquema = llamar_llm([{"role": "system", "content": SISTEMA}, {"role": "user", "content": prompt}],
-                         lambda t: _validar_esquema(t, n_sec))
+                         lambda t: _validar_esquema(t, n_sec, tema))
     secciones, previos = [], []
     for i, sec in enumerate(esquema["secciones"][:n_sec]):
         log(f"  Escribiendo sección {i + 1}/{n_sec}: {sec['titulo'][:50]}")
@@ -284,15 +358,22 @@ def guion_con_llm(tema: str, categoria: str, minutos: float) -> dict:
              f'Secciones ya escritas: {"; ".join(previos) or "ninguna"}.\n'
              f'Escribe SOLO la narración hablada de la sección {i + 1}/{n_sec}: "{sec["titulo"]}". '
              f'Puntos: {sec["puntos"]}.\n'
-             f"Requisitos: unas {PALABRAS_POR_SECCION} palabras, un solo párrafo de texto plano listo "
+             f"Escribe en español. Requisitos: unas {PALABRAS_POR_SECCION} palabras, un solo párrafo de texto plano listo "
              f"para que lo lea un locutor, sin títulos, viñetas, markdown, emojis ni acotaciones, con "
              f"puntuación natural. {extra}No repitas lo ya dicho.")
         try:
-            narr = llamar_llm([{"role": "system", "content": SISTEMA}, {"role": "user", "content": p}],
-                              _validar_narracion)
+            ctx = f'{tema} {sec["titulo"]} {sec["puntos"]} {sec["busqueda"]}'
+
+            def validar(t, ctx=ctx):
+                narr_ok = _validar_narracion(t, ctx)
+                if any(son_similares(narr_ok, previa["narracion"]) for previa in secciones):
+                    raise ValueError("texto repetido de otra sección")
+                return narr_ok
+            narr = llamar_llm([{"role": "system", "content": SISTEMA}, {"role": "user", "content": p}], validar)
         except Exception as e:  # noqa: BLE001
             log(f"  ! sección {i + 1} descartada: {str(e)[:100]}")
             continue
+        log(f"    «{narr[:90]}…»")
         secciones.append({"titulo": sec["titulo"], "narracion": narr,
                           "busqueda": sec["busqueda"] or sec["titulo"]})
         previos.append(sec["titulo"])
